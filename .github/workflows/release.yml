@@ -1,0 +1,277 @@
+name: IconConverter public release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iconconverter-public-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      RELEASE_WORK: 'C:\Temps\Temp_Builds\IconConverter\GitHub\${{ github.run_id }}-${{ github.run_attempt }}'
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      # Checkout đúng commit; actions/checkout v7.0.1 được cố định bằng SHA như WinUltimak.
+      - name: Checkout release package
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Xác thực manifest, hash, ZIP, MIT LICENSE và FileVersion trước khi tạo release.
+      - name: Validate release package
+        run: |
+          # Dừng ngay khi phát hiện dữ liệu thiếu hoặc thao tác filesystem lỗi.
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path $env:RELEASE_WORK -Force | Out-Null
+
+          # Đọc manifest tại đúng commit đang được phát hành.
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'release-manifest.json'
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.schemaVersion -ne 1) {
+              throw "Unsupported release manifest schema: $($manifest.schemaVersion)"
+          }
+
+          # Version bốn thành phần, tag và prerelease phải đúng định dạng.
+          $version = [string]$manifest.version
+          if ($version -cnotmatch '^\d+\.\d+\.\d+\.\d+$' -or ([version]$version).ToString() -cne $version) {
+              throw "Invalid release version: $version"
+          }
+          $expectedTag = "v$version"
+          if ([string]$manifest.tag -cne $expectedTag -or $manifest.prerelease -isnot [bool]) {
+              throw 'Invalid release tag or prerelease metadata.'
+          }
+
+          # Tự dựng đường dẫn từ version đã xác thực, không sử dụng path tùy ý trong manifest.
+          $zipFileName = "IconConverter_v$version.zip"
+          $checksumFileName = "$zipFileName.sha256"
+          $expectedAssetPath = "Releases/$expectedTag/$zipFileName"
+          $expectedChecksumPath = "Releases/$expectedTag/$checksumFileName"
+          if ([string]$manifest.assetPath -cne $expectedAssetPath -or [string]$manifest.checksumPath -cne $expectedChecksumPath) {
+              throw 'Manifest paths do not match the versioned Releases convention.'
+          }
+          $assetPath = Join-Path $env:GITHUB_WORKSPACE $expectedAssetPath
+          $checksumPath = Join-Path $env:GITHUB_WORKSPACE $expectedChecksumPath
+
+          # Yêu cầu ZIP và checksum có thật trong commit, với kích thước đúng manifest.
+          if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf) -or -not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
+              throw 'Release ZIP or checksum is missing.'
+          }
+          $actualSize = (Get-Item -LiteralPath $assetPath).Length
+          if ([long]$manifest.assetSize -le 0 -or $actualSize -ne [long]$manifest.assetSize) {
+              throw 'Release ZIP size does not match the manifest.'
+          }
+
+          # Đối chiếu SHA-256 trong manifest, ZIP và file checksum.
+          $expectedHash = [string]$manifest.assetSha256
+          if ($expectedHash -cnotmatch '^[a-f0-9]{64}$') {
+              throw 'Manifest SHA-256 must contain 64 lowercase hexadecimal characters.'
+          }
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $assetPath).Hash.ToLowerInvariant()
+          $checksumText = (Get-Content -LiteralPath $checksumPath -Raw).Trim()
+          if ($actualHash -cne $expectedHash -or $checksumText -cne "$expectedHash  $zipFileName") {
+              throw 'ZIP, checksum and manifest SHA-256 do not match.'
+          }
+
+          # Chỉ chấp nhận đúng hai file tại root ZIP, bao gồm phân biệt chữ hoa và chữ thường.
+          Add-Type -AssemblyName System.IO.Compression
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($assetPath)
+          try {
+              $entries = @($archive.Entries | ForEach-Object FullName | Sort-Object)
+              if ($entries.Count -ne 2 -or (Compare-Object @('IconConverter.exe', 'LICENSE') $entries -CaseSensitive)) {
+                  throw 'ZIP must contain exactly IconConverter.exe and LICENSE at its root.'
+              }
+
+              # Đọc toàn bộ MIT notice và đối chiếu với LICENSE tại root repo.
+              $licenseEntry = $archive.GetEntry('LICENSE')
+              $reader = [System.IO.StreamReader]::new($licenseEntry.Open())
+              try {
+                  $licenseText = $reader.ReadToEnd()
+              }
+              finally {
+                  $reader.Dispose()
+              }
+              if (-not $licenseText.StartsWith('MIT License') -or $licenseText -notmatch 'Copyright \(c\) 2026 Kmaster Kien Nguyen') {
+                  throw 'ZIP does not contain the expected MIT license.'
+              }
+
+              # So sánh hash LICENSE để bảo đảm nội dung byte giống bản được commit.
+              $licenseStream = $licenseEntry.Open()
+              $sha256 = [System.Security.Cryptography.SHA256]::Create()
+              try {
+                  $licenseHash = [Convert]::ToHexString($sha256.ComputeHash($licenseStream))
+              }
+              finally {
+                  $sha256.Dispose()
+                  $licenseStream.Dispose()
+              }
+              $rootLicenseHash = (Get-FileHash -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'LICENSE') -Algorithm SHA256).Hash
+              if ($licenseHash -cne $rootLicenseHash) {
+                  throw 'Packaged LICENSE differs from the release repository LICENSE.'
+              }
+
+              # Extract đúng entry EXE đã xác minh tên; không thực thi ứng dụng.
+              $executablePath = Join-Path $env:RELEASE_WORK 'IconConverter-public-candidate.exe'
+              $sourceStream = $archive.GetEntry('IconConverter.exe').Open()
+              try {
+                  $destinationStream = [System.IO.File]::Create($executablePath)
+                  try {
+                      $sourceStream.CopyTo($destinationStream)
+                  }
+                  finally {
+                      $destinationStream.Dispose()
+                  }
+              }
+              finally {
+                  $sourceStream.Dispose()
+              }
+          }
+          finally {
+              $archive.Dispose()
+          }
+
+          # Đọc FileVersion từ PE để kiểm chứng version thực tế bên trong ZIP.
+          $executableVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($executablePath).FileVersion
+          if ($executableVersion -cne $version) {
+              throw "Executable FileVersion '$executableVersion' does not equal '$version'."
+          }
+
+          # Chuyển những giá trị đã xác thực sang các bước tiếp theo.
+          @(
+              "RELEASE_TAG=$expectedTag",
+              "RELEASE_PRERELEASE=$($manifest.prerelease.ToString().ToLowerInvariant())",
+              "RELEASE_ZIP_PATH=$assetPath",
+              "RELEASE_CHECKSUM_PATH=$checksumPath",
+              "RELEASE_SHA256=$expectedHash"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Phục hồi draft nếu cần; release đã công khai chỉ được chấp nhận khi asset giống hệt.
+      - name: Publish verified public GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Dừng ngay khi PowerShell hoặc bất kỳ lệnh GitHub CLI nào báo lỗi.
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $zipFileName = [System.IO.Path]::GetFileName($env:RELEASE_ZIP_PATH)
+          $checksumFileName = [System.IO.Path]::GetFileName($env:RELEASE_CHECKSUM_PATH)
+
+          # Đọc đủ các trang để nhận diện cả draft và release cũ khi repo có nhiều version.
+          $releaseList = gh api "repos/$env:GH_REPO/releases?per_page=100" --paginate --slurp
+          if ($LASTEXITCODE) {
+              throw 'Cannot list existing GitHub releases.'
+          }
+          $matchingReleases = @($releaseList | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object tag_name -CEQ $env:RELEASE_TAG)
+          if ($matchingReleases.Count -gt 1) {
+              throw "Multiple releases use tag $env:RELEASE_TAG."
+          }
+          $existingRelease = $matchingReleases | Select-Object -First 1
+
+          # Chặn asset lạ hoặc tên trùng trước khi tạo hoặc cập nhật draft.
+          if ($null -ne $existingRelease) {
+              $releaseDetails = gh release view $env:RELEASE_TAG --repo $env:GH_REPO --json assets
+              if ($LASTEXITCODE) {
+                  throw "Cannot inspect release $env:RELEASE_TAG."
+              }
+              $assetNames = @((($releaseDetails | ConvertFrom-Json).assets | ForEach-Object name))
+              $unexpectedAssets = @($assetNames | Where-Object { $_ -cne $zipFileName -and $_ -cne $checksumFileName })
+              if ($unexpectedAssets.Count -gt 0 -or @($assetNames | Select-Object -Unique).Count -ne $assetNames.Count) {
+                  throw 'Existing release contains unexpected or duplicate assets.'
+              }
+          }
+
+          # Release công khai không được thay thế; chạy lại chỉ xác nhận nội dung giống hệt.
+          if ($null -ne $existingRelease -and -not $existingRelease.draft) {
+              if ($existingRelease.prerelease -ne [System.Convert]::ToBoolean($env:RELEASE_PRERELEASE)) {
+                  throw 'Published release has different prerelease metadata.'
+              }
+              $downloadDirectory = Join-Path $env:RELEASE_WORK 'existing-public-release'
+              New-Item -ItemType Directory -Path $downloadDirectory -Force | Out-Null
+              gh release download $env:RELEASE_TAG --repo $env:GH_REPO --dir $downloadDirectory --pattern $zipFileName --pattern $checksumFileName
+              if ($LASTEXITCODE) {
+                  throw 'Published release does not contain both expected assets.'
+              }
+
+              # Gói khác nội dung phải tăng version trước khi phát hành lại.
+              $downloadedHash = (Get-FileHash -LiteralPath (Join-Path $downloadDirectory $zipFileName) -Algorithm SHA256).Hash.ToLowerInvariant()
+              $downloadedChecksum = (Get-Content -LiteralPath (Join-Path $downloadDirectory $checksumFileName) -Raw).Trim()
+              if ($downloadedHash -cne $env:RELEASE_SHA256 -or $downloadedChecksum -cne "$env:RELEASE_SHA256  $zipFileName") {
+                  throw "Published release $env:RELEASE_TAG differs from the committed package. Increase the version."
+              }
+              Write-Host "Release $env:RELEASE_TAG already exists with identical assets."
+              exit 0
+          }
+
+          # Tạo draft mới tại đúng commit chứa package nếu chưa có release cùng tag.
+          if ($null -eq $existingRelease) {
+              gh release create $env:RELEASE_TAG --repo $env:GH_REPO --target $env:GITHUB_SHA --draft --title "IconConverter $env:RELEASE_TAG" --notes 'Windows x64 single-file release. Distributed under the MIT License. ZIP and SHA-256 verified before publication.'
+              if ($LASTEXITCODE) {
+                  throw "Cannot create draft release $env:RELEASE_TAG."
+              }
+          }
+
+          # Chỉ thay asset của draft để có thể tiếp tục lần phát hành bị gián đoạn.
+          gh release upload $env:RELEASE_TAG $env:RELEASE_ZIP_PATH $env:RELEASE_CHECKSUM_PATH --repo $env:GH_REPO --clobber
+          if ($LASTEXITCODE) {
+              throw 'Cannot upload release assets.'
+          }
+
+          # Tải xuống cả hai asset vừa upload vào vùng kiểm chứng riêng.
+          $verifyDirectory = Join-Path $env:RELEASE_WORK 'verify-public-release'
+          New-Item -ItemType Directory -Path $verifyDirectory -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GH_REPO --dir $verifyDirectory --pattern $zipFileName --pattern $checksumFileName
+          if ($LASTEXITCODE) {
+              throw 'Cannot download release assets for verification.'
+          }
+          $verifiedHash = (Get-FileHash -LiteralPath (Join-Path $verifyDirectory $zipFileName) -Algorithm SHA256).Hash.ToLowerInvariant()
+          $verifiedChecksum = (Get-Content -LiteralPath (Join-Path $verifyDirectory $checksumFileName) -Raw).Trim()
+          if ($verifiedHash -cne $env:RELEASE_SHA256 -or $verifiedChecksum -cne "$env:RELEASE_SHA256  $zipFileName") {
+              throw 'Uploaded release assets failed verification.'
+          }
+
+          # Công khai sau khi kiểm chứng thành công và đánh dấu Latest cho bản chính thức.
+          if ([System.Convert]::ToBoolean($env:RELEASE_PRERELEASE)) {
+              gh release edit $env:RELEASE_TAG --repo $env:GH_REPO --draft=false --prerelease=true --latest=false
+          }
+          else {
+              gh release edit $env:RELEASE_TAG --repo $env:GH_REPO --draft=false --prerelease=false --latest=true
+          }
+          if ($LASTEXITCODE) {
+              throw "Cannot publish release $env:RELEASE_TAG."
+          }
+
+      # Hiển thị liên kết kể cả khi lần chạy này chỉ xác nhận release đã có.
+      - name: Show release download links
+        run: |
+          # Ghi link trang release và hai asset vào tổng kết GitHub Actions.
+          $ErrorActionPreference = 'Stop'
+          $releaseUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG"
+          $downloadUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG"
+          $zipName = [System.IO.Path]::GetFileName($env:RELEASE_ZIP_PATH)
+          @(
+              "## IconConverter $env:RELEASE_TAG",
+              "",
+              "[Release]($releaseUrl)",
+              "",
+              "- [Download ZIP]($downloadUrl/$zipName)",
+              "- [Download SHA-256]($downloadUrl/$zipName.sha256)",
+              "",
+              "SHA-256: $env:RELEASE_SHA256"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

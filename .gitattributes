@@ -1,0 +1,8 @@
+# Cố định LICENSE để kiểm tra SHA-256 trong ZIP không phụ thuộc core.autocrlf.
+LICENSE text eol=lf
+
+# ZIP được giữ nguyên byte; các metadata release dùng LF thống nhất.
+*.zip binary
+*.sha256 text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
