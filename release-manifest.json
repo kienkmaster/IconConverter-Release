@@ -1,10 +1,10 @@
 {
     "schemaVersion":  1,
-    "version":  "1.0.0.14",
-    "tag":  "v1.0.0.14",
+    "version":  "1.0.0.15",
+    "tag":  "v1.0.0.15",
     "prerelease":  false,
-    "assetPath":  "Releases/v1.0.0.14/IconConverter_v1.0.0.14.zip",
-    "assetSize":  66201897,
-    "assetSha256":  "e6c42ec618745327671b4a349679daac0494d443eecd9380980bedc362057e9f",
-    "checksumPath":  "Releases/v1.0.0.14/IconConverter_v1.0.0.14.zip.sha256"
+    "assetPath":  "Releases/v1.0.0.15/IconConverter_v1.0.0.15.zip",
+    "assetSize":  66201890,
+    "assetSha256":  "6fb980708eafdf7141cd4358b41b67341fad96423f3571ec6710b2e0f897d97c",
+    "checksumPath":  "Releases/v1.0.0.15/IconConverter_v1.0.0.15.zip.sha256"
 }
